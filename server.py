@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import base64, hashlib, json, mimetypes, os, pathlib, queue, re, shutil, subprocess, tempfile, time, uuid, threading
+import base64, hashlib, hmac, json, mimetypes, os, pathlib, queue, re, secrets, shutil, subprocess, tempfile, time, uuid, threading
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -11,8 +11,14 @@ UPLOADS = DATA / "uploads"
 HISTORY = DATA / "generation_history.jsonl"
 PROMPT_FAVORITES = DATA / "prompt_favorites.json"
 KEYS = DATA / "api_keys.json"
+LOGIN_CONFIG = DATA / "login.json"
+LOGIN_SESSIONS = {}
+LOGIN_ATTEMPTS = {}
+LOGIN_LOCK = threading.Lock()
+LOGIN_TTL = 7 * 24 * 60 * 60
 HOST = os.environ.get("IMAGE_APP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("IMAGE_APP_PORT", "8900"))
+AUTH_ENABLED = os.environ.get("IMAGE_AUTH_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 API_BASE = os.environ.get("IMAGE_API_BASE", "https://www.hfsyapi.cn").rstrip("/")
 IMAGE_UPSTREAMS = {"hfsy": API_BASE, "tyai": "https://tyaiapi.com"}
 IMAGE_UPSTREAM_CONFIG = DATA / 'image_upstream.json'
@@ -96,7 +102,21 @@ $('run').onclick=()=>run().catch(e=>{log(e.message);$('resultStatus').textConten
 function updateSuccessRate(){const vals=history.flatMap(x=>x.results||[]);const done=vals.filter(x=>x.status==='success'||x.status==='error');const rate=done.length?Math.round(done.filter(x=>x.status==='success').length/done.length*100):null;const el=$('successRate');if(el)el.textContent=rate===null?'生图成功率：暂无数据':`生图成功率：${rate}%（${done.filter(x=>x.status==='success').length}/${done.length}）`}
 function addApiTools(){const select=$('analyzeModel');if(select&&!$('testAnalysisApi')){const b=document.createElement('button');b.id='testAnalysisApi';b.className='secondary';b.textContent='测试分析 API';b.style.cssText='margin-top:8px;width:100%;font-size:12px';b.onclick=async()=>{b.disabled=true;b.textContent='测试中…';try{const r=await api('/api/test-analysis',{});log(`分析 API 正常 · ${r.model} · ${r.latencyMs} ms`);b.textContent=`API 正常（${r.latencyMs} ms）`;b.style.color='var(--green)'}catch(e){log(`分析 API 测试失败：${e.message}`);b.textContent='API 测试失败';b.style.color='var(--red)'}finally{setTimeout(()=>{b.disabled=false},1500)}};select.parentElement.appendChild(b)}const rs=$('resultStatus');if(rs&&!$('successRate')){const el=document.createElement('span');el.id='successRate';el.className='status';el.style.cssText='display:block;margin-top:4px';rs.parentElement.appendChild(el)}updateSuccessRate()}
 function enhanceUi(){const s=document.createElement('style');s.textContent='.sidebar{padding:24px}.ui-intro{background:linear-gradient(135deg,#f6f8ff,#fff);border:1px solid #e0e7ff;border-radius:14px;padding:13px 14px;margin:-2px 0 18px}.ui-intro strong{display:block;font-size:13px;margin-bottom:4px}.ui-intro span{font-size:11px;color:var(--muted);line-height:1.55}.choice-label{font-size:12px;font-weight:700;color:#526074;margin:16px 0 8px}.choice-grid{display:grid;gap:8px}.choice-grid.two{grid-template-columns:1fr 1fr}.choice-card{border:1px solid #dfe4ec;border-radius:11px;background:#fff;color:#344054;padding:11px 10px;text-align:left;cursor:pointer;transition:.15s}.choice-card strong{display:block;font-size:12px}.choice-card small{display:block;color:var(--muted);font-size:10px;line-height:1.4;margin-top:4px}.choice-card.active{border-color:var(--blue);background:#f2f5ff;box-shadow:0 0 0 3px #edf1ff;color:#173fc1}.choice-card.active small{color:#526da9}.paste-hint{display:block;margin-top:8px;color:#526da9!important;font-size:11px!important}.dropzone{padding:20px 14px}.dropzone strong{font-size:13px}.advanced-model{opacity:.8}.advanced-model select{background:#f8fafc}.legacy-choice{position:absolute;opacity:0;pointer-events:none;width:1px;height:1px}.simple-divider{height:1px;background:var(--line);margin:20px 0}.quick-actions{display:flex;gap:8px;margin-top:9px}.quick-actions button{flex:1;font-size:11px;padding:8px}.paste-flash{animation:pasteFlash .7s ease}@keyframes pasteFlash{50%{border-color:var(--blue);background:#eef3ff}}';document.head.appendChild(s);const mode=$('mode'),model=$('model');if(mode&&!$('uiIntro')){const intro=document.createElement('div');intro.id='uiIntro';intro.className='ui-intro';intro.innerHTML='<strong>三步完成一套详情图</strong><span>粘贴或拖入参考图 → 选择生成方式 → 点击开始。第一张图决定手表身份，其余图片只辅助细节和风格。</span>';const first=mode.closest('.field');first.parentElement.insertBefore(intro,first);const makeChoices=(sel,title,items,cls)=>{const field=sel.closest('.field');field.classList.add('choice-field');const label=field.querySelector('label');label.classList.add('choice-label');const grid=document.createElement('div');grid.className='choice-grid '+(cls||'');items.forEach(item=>{const b=document.createElement('button');b.type='button';b.className='choice-card';b.dataset.value=item.value;b.innerHTML=`<strong>${item.title}</strong><small>${item.note}</small>`;b.onclick=()=>{sel.value=item.value;sel.dispatchEvent(new Event('change'));sync()};grid.appendChild(b)});field.insertBefore(grid,sel);sel.classList.add('legacy-choice');function sync(){grid.querySelectorAll('.choice-card').forEach(b=>b.classList.toggle('active',b.dataset.value===sel.value))}sel.addEventListener('change',sync);sync()};makeChoices(mode,'生成方式',[{value:'analyze',title:'智能分析并生成',note:'自动提炼卖点，生成多张详情图'},{value:'prompt',title:'直接按提示词生成',note:'适合已有完整提示词的情况'}],'two');makeChoices(model,'生图模型',[{value:'gpt-image-2',title:'GPT Image 2',note:'细节与商品图表现优先'},{value:'nano-banana-2',title:'Nano Banana 2',note:'适合参考图套图与风格迁移'}],'two')}const dz=document.querySelector('.dropzone');if(dz&&!dz.querySelector('.paste-hint')){const h=document.createElement('small');h.className='paste-hint';h.textContent='也可以直接在本页面按 ⌘V / Ctrl+V 粘贴图片';dz.appendChild(h)}document.addEventListener('paste',async e=>{const files=[];for(const item of e.clipboardData?.items||[]){if(item.kind==='file'&&item.type.startsWith('image/')){const f=item.getAsFile();if(f)files.push(new File([f],`pasted-${Date.now()}-${files.length+1}.${f.type.split('/')[1]||'png'}`,{type:f.type}))}}if(!files.length)return;e.preventDefault();let added=0;for(const f of files){if(refs.length>=7)break;refs.push({file:f,preview:URL.createObjectURL(f)});added++}renderThumbs();if(dz)dz.classList.add('paste-flash');setTimeout(()=>dz&&dz.classList.remove('paste-flash'),800);log(`已从剪贴板添加 ${added} 张图片`)});const advanced=$('analyzeModel')?.closest('.field');if(advanced)advanced.classList.add('advanced-model')}
-$('run').onclick=()=>run().catch(e=>{log(e.message);$('resultStatus').textContent='执行失败'});$('export').onclick=()=>exportAll().catch(e=>log(e.message));$('refresh').onclick=()=>current&&renderResults();$('historyBtn').onclick=()=>$('history').scrollIntoView({behavior:'smooth'});$('keyBtn').onclick=()=>{$('keyPanel').classList.toggle('hidden');$('apiKey').focus()};$('saveKey').onclick=async()=>{await api('/api/keys',{hfsy:$('apiKey').value.trim()});log('API Key 已保存到服务器')};$('clearKey').onclick=async()=>{await api('/api/keys',{hfsy:''});$('apiKey').value='';log('API Key 已清除')};$('reloadHistory').onclick=loadHistory;loadHistory().catch(e=>log(e.message));api('/api/keys',null,'GET').then(x=>{$('apiKey').value=x.hfsy||''}).catch(()=>{});$('mode').onchange=refreshModeUI;$('count').onchange=()=>{if($('count').value==='1'&&$('mode').value!=='prompt'){$('mode').value='prompt';$('mode').dispatchEvent(new Event('change'))}else refreshModeUI()};refreshModeUI();$('clearThumbs').onclick=()=>{refs=[];$('files').value='';renderThumbs()};addApiTools();enhanceUi();setInterval(updateSuccessRate,3000);
+// Output count and generation mode are independent. Choosing direct-prompt mode
+// defaults the count to one; selecting one image must not switch modes.
+$('run').onclick=()=>run().catch(e=>{log(e.message);$('resultStatus').textContent='执行失败'});
+$('export').onclick=()=>exportAll().catch(e=>log(e.message));
+$('refresh').onclick=()=>current&&renderResults();
+$('historyBtn').onclick=()=>$('history').scrollIntoView({behavior:'smooth'});
+$('keyBtn').onclick=()=>{$('keyPanel').classList.toggle('hidden');$('apiKey').focus()};
+$('saveKey').onclick=async()=>{await api('/api/keys',{hfsy:$('apiKey').value.trim()});log('API Key 已保存到服务器')};
+$('clearKey').onclick=async()=>{await api('/api/keys',{hfsy:''});$('apiKey').value='';log('API Key 已清除')};
+$('reloadHistory').onclick=loadHistory;loadHistory().catch(e=>log(e.message));
+api('/api/keys',null,'GET').then(x=>{$('apiKey').value=x.hfsy||''}).catch(()=>{});
+$('mode').onchange=refreshModeUI;
+$('count').onchange=()=>refreshModeUI();
+refreshModeUI();$('clearThumbs').onclick=()=>{refs=[];$('files').value='';renderThumbs()};
+addApiTools();enhanceUi();setInterval(updateSuccessRate,3000);
 </script><script>
 (()=>{const clean=()=>{document.querySelector('.hero')?.remove();document.querySelector('.ui-intro')?.remove();document.querySelector('.brand p')?.remove();document.querySelectorAll('.sidebar .section-title p,.sidebar .note').forEach(x=>x.remove());const am=document.querySelector('#analyzeModel');if(am){am.value='gpt-5.6-terra';am.disabled=true;const f=am.closest('.field');if(f){const l=f.querySelector('label');if(l)l.innerHTML='分析 API <span>GPT-5.6 Terra · 已固定</span>';am.style.display='none'}}const test=document.querySelector('#testAnalysisApi');if(test){test.textContent='测试分析 API';test.style.marginTop='8px'}document.querySelectorAll('.content>.panel,.content>.logs').forEach(x=>x.style.boxShadow='0 4px 18px rgba(26,39,68,.035)');document.querySelector('.workspace')?.classList.add('simple-page')};clean()})()
 </script><script>
@@ -314,6 +334,18 @@ HTML=HTML.replace('</body></html>',HTML_RESULT_VERSION_FIX+'''<script>
 </script></body></html>''')
 HTML=HTML.replace("am.value='gpt-5.6-terra'","am.value='gpt-5.6-sol'").replace("analysisModel.value='gpt-5.6-terra'","analysisModel.value='gpt-5.6-sol'").replace('GPT-5.6 Terra 正在分析','GPT-5.6 Sol 正在分析')
 HTML=HTML.replace('提示词收藏','提示词模板库').replace('收藏当前提示词','保存当前模板').replace('收藏提示词','提示词模板').replace('已载入提示词模板','已载入提示词模板').replace('已载入收藏提示词','已载入提示词模板').replace('自定义提示词已收藏','自定义提示词模板已保存').replace('收藏提示词已更新','提示词模板已更新').replace('收藏于 ','保存于 ')
+if AUTH_ENABLED:HTML=HTML.replace('</body></html>','''<script>(()=>{const top=document.querySelector('.top-actions');if(!top)return;const button=document.createElement('button');button.type='button';button.className='secondary';button.textContent='退出登录';button.onclick=async()=>{await fetch('/studio/logout',{method:'POST'});location.replace('/studio/')};top.appendChild(button)})();</script></body></html>''')
+HTML_MODE_COUNT_FIX='''<style>.top-actions #keyBtn{display:none!important}</style><script>(()=>{document.getElementById('keyBtn')?.remove();const mode=document.getElementById('mode'),count=document.getElementById('count');if(!mode||!count)return;const sync=()=>document.getElementById('analyzeModel')?.closest('.build-section')?.classList.toggle('hidden',mode.value==='prompt');mode.addEventListener('change',()=>{if(mode.value==='prompt')count.value='1';sync()});count.addEventListener('change',sync);sync()})();</script>'''
+HTML=HTML.replace('</body></html>',HTML_MODE_COUNT_FIX+'</body></html>')
+
+LOGIN_HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>登录 · Watch Studio</title><style>
+:root{font-family:Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;color:#202938;background:#f3f5f8}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,#f5f7fa,#edf1f6)}.login{width:min(100%,400px);background:#fff;border:1px solid #e1e6ed;border-radius:12px;padding:32px;box-shadow:0 18px 55px rgba(25,39,60,.09)}.brand{display:flex;align-items:center;gap:12px;margin-bottom:30px}.mark{width:42px;height:42px;border-radius:11px;background:#315efb;color:white;display:grid;place-items:center;font-weight:800;font-size:18px}.brand strong{font-size:15px;display:block}.brand span{display:block;color:#7b8797;font-size:12px;margin-top:3px}.title{margin:0 0 7px;font-size:23px;font-weight:680;letter-spacing:0}.hint{margin:0 0 24px;color:#707c8d;font-size:13px}.field{margin:17px 0}.field label{display:block;font-size:12px;font-weight:650;margin:0 0 8px;color:#485466}.field input{width:100%;height:44px;border:1px solid #d8dee7;border-radius:7px;padding:0 12px;font:inherit;color:#202938;background:#fff;outline:none}.field input:focus{border-color:#5e7ef5;box-shadow:0 0 0 3px #e9eeff}.submit{height:44px;width:100%;margin-top:8px;border:0;border-radius:7px;background:#315efb;color:#fff;font:inherit;font-size:14px;font-weight:600;cursor:pointer}.submit:hover{background:#244de0}.error{padding:10px 12px;border:1px solid #f2c9c9;border-radius:7px;background:#fff5f4;color:#a63e39;font-size:13px;margin:0 0 16px}.foot{margin-top:22px;text-align:center;color:#98a1ae;font-size:11px}@media(max-width:420px){.login{padding:25px 22px}}
+</style></head><body><main class="login"><div class="brand"><div class="mark">W</div><div><strong>Watch Studio</strong><span>账号安全登录</span></div></div><h1 class="title">欢迎回来</h1><p class="hint">登录以继续使用工作台</p>{{ERROR}}<form method="post" action="/studio/login" autocomplete="on"><div class="field"><label for="username">账号</label><input id="username" name="username" autocomplete="username" required autofocus></div><div class="field"><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required></div><button class="submit" type="submit">登录</button></form><div class="foot">Watch Studio</div></main></body></html>'''
+
+def render_login(error=False):
+    message='<div class="error" role="alert">账号或密码不正确，请重试。</div>' if error else ''
+    return LOGIN_HTML.replace('{{ERROR}}',message).encode()
+
 def json_response(h, status, payload):
     data=json.dumps(payload,ensure_ascii=False).encode();h.send_response(status);h.send_header('Content-Type','application/json; charset=utf-8');h.send_header('Content-Length',str(len(data)));h.end_headers();h.wfile.write(data)
 def read_json(h):
@@ -998,7 +1030,53 @@ def save_generated_image(source_url,ip,generation_id,index):
 def records():
     return history_records()
 class Handler(BaseHTTPRequestHandler):
+    def _session_ok(self):
+        if not AUTH_ENABLED:return True
+        match=re.search(r'(?:^|;\s*)watchstudio_session=([a-f0-9]{64})(?:;|$)',self.headers.get('Cookie',''))
+        if not match:return False
+        token=match.group(1);now=time.time()
+        with LOGIN_LOCK:
+            expires=LOGIN_SESSIONS.get(token)
+            if not expires:return False
+            if expires<now:
+                LOGIN_SESSIONS.pop(token,None);return False
+            return True
+    def _send_login(self,status=200,error=False):
+        data=render_login(error);self.send_response(status);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data)
+    def _handle_login(self):
+        try:
+            length=min(int(self.headers.get('Content-Length','0')),4096)
+            form=urllib.parse.parse_qs(self.rfile.read(length).decode('utf-8','replace'))
+            username=(form.get('username') or [''])[0][:128];password=(form.get('password') or [''])[0][:1024]
+            client=str(self.headers.get('X-Remote-Addr') or self.client_address[0]);now=time.time();config=json.loads(LOGIN_CONFIG.read_text())
+            with LOGIN_LOCK:
+                attempts=[t for t in LOGIN_ATTEMPTS.get(client,[]) if now-t<600]
+                LOGIN_ATTEMPTS[client]=attempts
+                blocked=len(attempts)>=8
+            valid=False
+            if not blocked and username==str(config.get('username') or ''):
+                digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(config['salt']),int(config.get('rounds',310000))).hex()
+                valid=hmac.compare_digest(digest,str(config.get('passwordHash') or ''))
+            if not valid:
+                with LOGIN_LOCK:LOGIN_ATTEMPTS.setdefault(client,[]).append(now)
+                return self._send_login(429 if blocked else 401,True)
+            with LOGIN_LOCK:LOGIN_ATTEMPTS.pop(client,None)
+            token=secrets.token_hex(32)
+            with LOGIN_LOCK:LOGIN_SESSIONS[token]=now+LOGIN_TTL
+            self.send_response(303);self.send_header('Location','/studio/');self.send_header('Set-Cookie',f'watchstudio_session={token}; Path=/studio/; Max-Age={LOGIN_TTL}; HttpOnly; Secure; SameSite=Lax');self.send_header('Cache-Control','no-store');self.end_headers()
+        except Exception:
+            return self._send_login(503,True)
+    def _handle_logout(self):
+        match=re.search(r'(?:^|;\s*)watchstudio_session=([a-f0-9]{64})(?:;|$)',self.headers.get('Cookie',''))
+        if match:
+            with LOGIN_LOCK:LOGIN_SESSIONS.pop(match.group(1),None)
+        self.send_response(303);self.send_header('Location','/studio/');self.send_header('Set-Cookie','watchstudio_session=; Path=/studio/; Max-Age=0; HttpOnly; Secure; SameSite=Lax');self.send_header('Cache-Control','no-store');self.end_headers()
     def do_GET(self):
+        route=urllib.parse.urlsplit(self.path).path
+        if route=='/login' and AUTH_ENABLED:return self._send_login()
+        if not self._session_ok():
+            if route in ('/','/index.html'):return self._send_login()
+            return json_response(self,401,{'error':'login required'})
         if self.path.startswith('/api/test-analysis-batch/'):
             batch_id=urllib.parse.unquote(self.path.rsplit('/',1)[-1])
             with ANALYSIS_BATCH_LOCK: batch=ANALYSIS_BATCHES.get(batch_id)
@@ -1039,6 +1117,10 @@ class Handler(BaseHTTPRequestHandler):
             data=path.read_bytes();self.send_response(200);self.send_header('Content-Type','image/png');self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store, no-cache, must-revalidate, max-age=0');self.send_header('Pragma','no-cache');self.end_headers();self.wfile.write(data);return
         json_response(self,404,{'error':'not found'})
     def do_POST(self):
+        route=urllib.parse.urlsplit(self.path).path
+        if route=='/login' and AUTH_ENABLED:return self._handle_login()
+        if route=='/logout' and AUTH_ENABLED:return self._handle_logout()
+        if not self._session_ok():return json_response(self,401,{'error':'login required'})
         try:body=read_json(self)
         except Exception:return json_response(self,400,{'error':'invalid json'})
         try:

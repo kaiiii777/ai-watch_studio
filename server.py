@@ -15,6 +15,7 @@ LOGIN_CONFIG = DATA / "login.json"
 LOGIN_SESSIONS = {}
 LOGIN_ATTEMPTS = {}
 LOGIN_LOCK = threading.Lock()
+INTERNAL_WORKER_TOKEN = secrets.token_urlsafe(32)
 LOGIN_TTL = 7 * 24 * 60 * 60
 HOST = os.environ.get("IMAGE_APP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("IMAGE_APP_PORT", "8900"))
@@ -344,6 +345,8 @@ HTML_MODE_COUNT_FIX='''<style>.top-actions #keyBtn{display:none!important}</styl
 HTML=HTML.replace('</body></html>',HTML_MODE_COUNT_FIX+'</body></html>')
 HTML_TASK_ERROR_FIX='''<script>(()=>{const button=document.getElementById('run');if(!button)return;button.onclick=()=>window.run().catch(error=>{const message=String(error?.message||error);log('任务创建失败：'+message);document.getElementById('resultStatus').textContent='任务创建失败';document.getElementById('resultGrid').innerHTML='<div class="work-state"><strong>任务未创建</strong><span style="display:block!important;white-space:pre-wrap">'+esc(message)+'</span></div>'})})();</script>'''
 HTML=HTML.replace('</body></html>',HTML_TASK_ERROR_FIX+'</body></html>')
+HTML_FAILED_HISTORY_FIX='''<script>(()=>{const grid=document.getElementById('resultGrid');if(!grid)return;const showFailure=()=>{if(current?.status!=='failed'||(current.prompts||[]).length)return;const title='分析失败，未发出生图请求';if(grid.querySelector('.work-state strong')?.textContent===title)return;grid.innerHTML='<div class="work-state"><strong>'+title+'</strong><span style="display:block!important;white-space:pre-wrap">'+esc(current.error||'请重新创建任务')+'</span></div>'};new MutationObserver(showFailure).observe(grid,{childList:true});document.addEventListener('click',event=>{if(event.target.closest('#historyList [data-task]'))setTimeout(showFailure,0)})})();</script>'''
+HTML=HTML.replace('</body></html>',HTML_FAILED_HISTORY_FIX+'</body></html>')
 
 LOGIN_HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>登录 · Watch Studio</title><style>
 :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;color:#202938;background:#f3f5f8}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,#f5f7fa,#edf1f6)}.login{width:min(100%,400px);background:#fff;border:1px solid #e1e6ed;border-radius:12px;padding:32px;box-shadow:0 18px 55px rgba(25,39,60,.09)}.brand{display:flex;align-items:center;gap:12px;margin-bottom:30px}.mark{width:42px;height:42px;border-radius:11px;background:#315efb;color:white;display:grid;place-items:center;font-weight:800;font-size:18px}.brand strong{font-size:15px;display:block}.brand span{display:block;color:#7b8797;font-size:12px;margin-top:3px}.title{margin:0 0 7px;font-size:23px;font-weight:680;letter-spacing:0}.hint{margin:0 0 24px;color:#707c8d;font-size:13px}.field{margin:17px 0}.field label{display:block;font-size:12px;font-weight:650;margin:0 0 8px;color:#485466}.field input{width:100%;height:44px;border:1px solid #d8dee7;border-radius:7px;padding:0 12px;font:inherit;color:#202938;background:#fff;outline:none}.field input:focus{border-color:#5e7ef5;box-shadow:0 0 0 3px #e9eeff}.submit{height:44px;width:100%;margin-top:8px;border:0;border-radius:7px;background:#315efb;color:#fff;font:inherit;font-size:14px;font-weight:600;cursor:pointer}.submit:hover{background:#244de0}.error{padding:10px 12px;border:1px solid #f2c9c9;border-radius:7px;background:#fff5f4;color:#a63e39;font-size:13px;margin:0 0 16px}.foot{margin-top:22px;text-align:center;color:#98a1ae;font-size:11px}@media(max-width:420px){.login{padding:25px 22px}}
@@ -771,7 +774,7 @@ def history_records():
         out.append(item)
     return out
 def internal_post(path,payload,timeout=900):
-    req=urllib.request.Request(f'http://127.0.0.1:{PORT}{path}',data=json.dumps(payload,ensure_ascii=False).encode(),headers={'Content-Type':'application/json','User-Agent':'WatchStudio-Worker/1.0'})
+    req=urllib.request.Request(f'http://127.0.0.1:{PORT}{path}',data=json.dumps(payload,ensure_ascii=False).encode(),headers={'Content-Type':'application/json','User-Agent':'WatchStudio-Worker/1.0','X-WatchStudio-Worker-Token':INTERNAL_WORKER_TOKEN})
     try:
         with direct_open(req,timeout=timeout) as response:
             raw=response.read().decode('utf-8','replace');return response.status,json.loads(raw) if raw else {}
@@ -1039,6 +1042,7 @@ def records():
 class Handler(BaseHTTPRequestHandler):
     def _session_ok(self):
         if not AUTH_ENABLED:return True
+        if self.client_address[0] in ('127.0.0.1','::1') and hmac.compare_digest(self.headers.get('X-WatchStudio-Worker-Token',''),INTERNAL_WORKER_TOKEN):return True
         match=re.search(r'(?:^|;\s*)watchstudio_session=([a-f0-9]{64})(?:;|$)',self.headers.get('Cookie',''))
         if not match:return False
         token=match.group(1);now=time.time()
@@ -1079,6 +1083,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOGIN_LOCK:LOGIN_SESSIONS.pop(match.group(1),None)
         self.send_response(303);self.send_header('Location','/studio/');self.send_header('Set-Cookie','watchstudio_session=; Path=/studio/; Max-Age=0; HttpOnly; Secure; SameSite=Lax');self.send_header('Cache-Control','no-store');self.end_headers()
     def do_GET(self):
+        if self.path.startswith(('/studio/api/','/studio/uploads/','/studio/outputs/')):self.path=self.path[len('/studio'):]
         route=urllib.parse.urlsplit(self.path).path
         if route=='/login' and AUTH_ENABLED:return self._send_login()
         if not self._session_ok():
@@ -1124,6 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
             data=path.read_bytes();self.send_response(200);self.send_header('Content-Type','image/png');self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store, no-cache, must-revalidate, max-age=0');self.send_header('Pragma','no-cache');self.end_headers();self.wfile.write(data);return
         json_response(self,404,{'error':'not found'})
     def do_POST(self):
+        if self.path.startswith('/studio/api/'):self.path=self.path[len('/studio'):]
         route=urllib.parse.urlsplit(self.path).path
         if route=='/login' and AUTH_ENABLED:return self._handle_login()
         if route=='/logout' and AUTH_ENABLED:return self._handle_logout()
